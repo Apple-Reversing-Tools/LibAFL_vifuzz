@@ -242,6 +242,58 @@ where
         self
     }
 
+    /// Enable comparison coverage
+    #[must_use]
+    pub fn cmp_coverage(mut self) -> Self {
+        self.tinyinst_args.push("-cmp_coverage".to_string());
+        self
+    }
+
+    /// Generate unwind information
+    #[must_use]
+    pub fn generate_unwind(mut self) -> Self {
+        self.tinyinst_args.push("-generate_unwind".to_string());
+        self
+    }
+
+    /// Set maximum sample size
+    #[must_use]
+    pub fn max_sample_size(mut self, size: usize) -> Self {
+        self.tinyinst_args.push("-max_sample_size".to_string());
+        self.tinyinst_args.push(size.to_string());
+        self
+    }
+
+    /// Set target environment variable
+    #[must_use]
+    pub fn target_env(mut self, key: &str, value: &str) -> Self {
+        self.tinyinst_args.push("-target_env".to_string());
+        self.tinyinst_args.push(format!("{}={}", key, value));
+        self
+    }
+
+    /// Set target offset
+    #[must_use]
+    pub fn target_offset(mut self, offset: usize) -> Self {
+        self.tinyinst_args.push("-target_offset".to_string());
+        self.tinyinst_args.push(format!("0x{:x}", offset));
+        self
+    }
+
+    /// Enable call coverage
+    #[must_use]
+    pub fn call_coverage(mut self) -> Self {
+        self.tinyinst_args.push("-callcov".to_string());
+        self
+    }
+
+    /// Instrument indirect calls/jumps
+    #[must_use]
+    pub fn instrument_indirect(mut self) -> Self {
+        self.tinyinst_args.push("-instrument_indirect".to_string());
+        self
+    }
+
     /// Build [`TinyInst`](https://github.com/googleprojectzero/TinyInst) executor
     pub fn build<OT, S>(
         &mut self,
