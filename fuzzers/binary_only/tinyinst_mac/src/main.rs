@@ -5,7 +5,13 @@
 //! - MmapShMemProvider for POSIX shared memory compatibility
 //! - Persistent mode fuzzing with the `_fuzz` entry point
 //! - Coverage-guided fuzzing with cumulative offset tracking
-//! - Multi-process fuzzing with shared corpus
+//! - Multi-process fuzzing with file-based corpus sharing
+//!
+//! # Note on corpus sharing
+//! TinyInst doesn't support fork(), which is typically used by LibAFL's LLMP for
+//! lock-free corpus sharing. Instead, this fuzzer uses file-based corpus synchronization
+//! via OnDiskCorpus with periodic scanning. Given TinyInst's low throughput (~3 exec/sec
+//! for ImageIO), file-based sync is sufficient and avoids additional complexity.
 //!
 //! # Building the harness
 //! ```bash
@@ -15,12 +21,16 @@
 //! # Running
 //! ```bash
 //! # Single process
-//! sudo ./target/debug/tinyinst_mac
+//! sudo ./target/release/tinyinst_mac
 //!
-//! # Multi-process (4 workers)
-//! sudo ./target/debug/tinyinst_mac --workers 4
+//! # Multi-process (4 workers with shared corpus)
+//! sudo ./target/release/tinyinst_mac --workers 4
+//!
+//! # With custom corpus/crashes directory
+//! CORPUS_DIR=./my_corpus CRASHES_DIR=./my_crashes sudo ./target/release/tinyinst_mac
 //! ```
 use std::{
+    collections::HashSet,
     env,
     fs,
     path::PathBuf,
@@ -61,8 +71,9 @@ fn main() {
 fn main() {
     env_logger::init();
 
-    // Check if we're a worker process
     let args: Vec<String> = env::args().collect();
+    
+    // Check for --worker-id (internal use for spawned workers)
     let worker_id = args
         .iter()
         .position(|arg| arg == "--worker-id")
@@ -70,13 +81,12 @@ fn main() {
         .and_then(|id| id.parse::<usize>().ok());
 
     if let Some(id) = worker_id {
-        // We're a worker - run fuzzer
         println!("=== Worker {} starting ===", id);
         run_worker(id);
         return;
     }
 
-    // Check if we should spawn multiple workers
+    // Check for --workers N
     let num_workers = args
         .iter()
         .position(|arg| arg == "--workers")
@@ -86,7 +96,7 @@ fn main() {
 
     if num_workers > 1 {
         println!("=== TinyInst ImageIO Fuzzer for macOS ===");
-        println!("Spawning {} worker processes...\n", num_workers);
+        println!("Spawning {} worker processes with shared corpus...\n", num_workers);
         spawn_workers(num_workers);
     } else {
         println!("=== TinyInst ImageIO Fuzzer for macOS (single process) ===\n");
@@ -94,36 +104,7 @@ fn main() {
     }
 }
 
-#[cfg(target_vendor = "apple")]
-fn spawn_workers(num_workers: usize) {
-    let exe_path = env::current_exe().expect("Failed to get executable path");
-    let mut children = Vec::new();
-
-    for worker_id in 0..num_workers {
-        let child = Command::new(&exe_path)
-            .arg("--worker-id")
-            .arg(worker_id.to_string())
-            .spawn()
-            .expect("Failed to spawn worker");
-
-        println!("Spawned worker {} (PID: {})", worker_id, child.id());
-        children.push(child);
-
-        // Small delay between spawns
-        thread::sleep(Duration::from_millis(500));
-    }
-
-    println!("\nAll workers started. Press Ctrl+C to stop all workers.\n");
-
-    // Wait for all workers
-    for (id, mut child) in children.into_iter().enumerate() {
-        match child.wait() {
-            Ok(status) => println!("Worker {} exited with status: {}", id, status),
-            Err(e) => eprintln!("Worker {} error: {}", id, e),
-        }
-    }
-}
-
+/// Run a worker process
 #[cfg(target_vendor = "apple")]
 fn run_worker(worker_id: usize) {
     // Target module to instrument and collect coverage
@@ -143,41 +124,25 @@ fn run_worker(worker_id: usize) {
     // Use MmapShMemProvider for macOS POSIX shared memory compatibility
     let mut shmem_provider = MmapShMemProvider::with_filename_as_id();
 
-    // Shared corpus directory (all workers share the same corpus)
-    let corpus_dir = PathBuf::from("./corpus");
-    let mut corpus = OnDiskCorpus::new(corpus_dir).unwrap();
+    // Shared corpus directory (can be overridden via CORPUS_DIR env var)
+    let corpus_dir = env::var("CORPUS_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| PathBuf::from("./corpus"));
+    fs::create_dir_all(&corpus_dir).ok();
+    let mut corpus = OnDiskCorpus::new(corpus_dir.clone()).unwrap();
 
-    // Load seed images from seeds directory (only if corpus is empty)
+    // Load seeds (only if corpus is empty)
     if corpus.count() == 0 {
-        let seed_dir = PathBuf::from("../../../seeds/pngs");
-        if seed_dir.exists() {
-            println!("[Worker {}] Loading seeds...", worker_id);
-            for entry in fs::read_dir(&seed_dir).expect("Failed to read seeds directory") {
-                let entry = entry.expect("Failed to read entry");
-                let path = entry.path();
-                if path.is_file() {
-                    match fs::read(&path) {
-                        Ok(data) => {
-                            println!(
-                                "[Worker {}] Loading seed: {} ({} bytes)",
-                                worker_id,
-                                path.display(),
-                                data.len()
-                            );
-                            let input = BytesInput::new(data);
-                            corpus
-                                .add(Testcase::new(input))
-                                .expect("error in adding corpus");
-                        }
-                        Err(e) => eprintln!("Failed to read {}: {}", path.display(), e),
-                    }
-                }
-            }
-        }
+        load_seeds(&mut corpus, worker_id);
     }
 
     println!("[Worker {}] Corpus size: {}", worker_id, corpus.count());
-    let solutions = OnDiskCorpus::new(PathBuf::from("./crashes")).unwrap();
+    
+    let crashes_dir = env::var("CRASHES_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| PathBuf::from("./crashes"));
+    fs::create_dir_all(&crashes_dir).ok();
+    let solutions = OnDiskCorpus::new(crashes_dir).unwrap();
 
     let mut objective = CrashFeedback::new();
     let rand = StdRand::new();
@@ -192,7 +157,6 @@ fn run_worker(worker_id: usize) {
     });
 
     let mut mgr = SimpleEventManager::new(monitor);
-    // Check if persistent mode is enabled via environment variable
     let use_persistent = env::var("PERSISTENT").is_ok();
     
     let mut executor = if use_persistent {
@@ -204,7 +168,6 @@ fn run_worker(worker_id: usize) {
             .generate_unwind()
             .program_args(args)
             .use_shmem()
-            // Note: macOS mangles C function names with underscore prefix
             .persistent("imageio".to_string(), "_fuzz".to_string(), 1, 10000)
             .timeout(Duration::new(5, 0))
             .shmem_provider(&mut shmem_provider)
@@ -233,15 +196,11 @@ fn run_worker(worker_id: usize) {
     println!("[Worker {}] Starting ImageIO fuzzer...", worker_id);
     println!("[Worker {}] Press Ctrl+C to stop\n", worker_id);
 
-    // Run fuzzing loop with coverage tracking
-    let start = Instant::now();
-    let mut last_cov_print = Instant::now();
+    // File-based corpus sync state
     let mut last_corpus_sync = Instant::now();
-    let mut executions: u64 = 0;
-    let mut known_corpus_files: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut known_corpus_files: HashSet<String> = HashSet::new();
     
     // Track existing corpus files
-    let corpus_dir = PathBuf::from("./corpus");
     if corpus_dir.exists() {
         if let Ok(entries) = fs::read_dir(&corpus_dir) {
             for entry in entries.flatten() {
@@ -251,6 +210,10 @@ fn run_worker(worker_id: usize) {
             }
         }
     }
+
+    let start = Instant::now();
+    let mut last_cov_print = Instant::now();
+    let mut executions: u64 = 0;
 
     loop {
         match fuzzer.fuzz_one(&mut stages, &mut executor, &mut state, &mut mgr) {
@@ -274,7 +237,6 @@ fn run_worker(worker_id: usize) {
                 for entry in entries.flatten() {
                     if let Some(name) = entry.file_name().to_str() {
                         if !known_corpus_files.contains(name) {
-                            // New file from another worker
                             if let Ok(data) = fs::read(entry.path()) {
                                 let input = BytesInput::new(data);
                                 if state.corpus_mut().add(Testcase::new(input)).is_ok() {
@@ -321,7 +283,6 @@ fn run_worker(worker_id: usize) {
                 state.corpus().count()
             );
 
-            // Print sample offsets
             let offsets = executor.cumulative_coverage();
             if !offsets.is_empty() {
                 let sample: Vec<String> = offsets
@@ -334,6 +295,66 @@ fn run_worker(worker_id: usize) {
             println!();
 
             last_cov_print = Instant::now();
+        }
+    }
+}
+
+/// Load seed files into corpus
+#[cfg(target_vendor = "apple")]
+fn load_seeds(corpus: &mut OnDiskCorpus<BytesInput>, worker_id: usize) {
+    let seed_dir = PathBuf::from("../../../seeds/pngs");
+    if seed_dir.exists() {
+        println!("[Worker {}] Loading seeds...", worker_id);
+        for entry in fs::read_dir(&seed_dir).expect("Failed to read seeds directory") {
+            let entry = entry.expect("Failed to read entry");
+            let path = entry.path();
+            if path.is_file() {
+                match fs::read(&path) {
+                    Ok(data) => {
+                        println!(
+                            "[Worker {}] Loading seed: {} ({} bytes)",
+                            worker_id,
+                            path.display(),
+                            data.len()
+                        );
+                        let input = BytesInput::new(data);
+                        corpus
+                            .add(Testcase::new(input))
+                            .expect("error in adding corpus");
+                    }
+                    Err(e) => eprintln!("Failed to read {}: {}", path.display(), e),
+                }
+            }
+        }
+    }
+}
+
+/// Spawn multiple worker processes
+#[cfg(target_vendor = "apple")]
+fn spawn_workers(num_workers: usize) {
+    let exe_path = env::current_exe().expect("Failed to get executable path");
+    let mut children = Vec::new();
+
+    for worker_id in 0..num_workers {
+        let child = Command::new(&exe_path)
+            .arg("--worker-id")
+            .arg(worker_id.to_string())
+            .envs(env::vars())  // Pass through environment variables
+            .spawn()
+            .expect("Failed to spawn worker");
+
+        println!("Spawned worker {} (PID: {})", worker_id, child.id());
+        children.push(child);
+
+        thread::sleep(Duration::from_millis(500));
+    }
+
+    println!("\nAll workers started. Press Ctrl+C to stop all workers.\n");
+
+    for (id, mut child) in children.into_iter().enumerate() {
+        match child.wait() {
+            Ok(status) => println!("Worker {} exited with status: {}", id, status),
+            Err(e) => eprintln!("Worker {} error: {}", id, e),
         }
     }
 }

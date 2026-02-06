@@ -1,89 +1,25 @@
 //! Multi-threaded launcher for `TinyInst` fuzzing
 //!
-//! This module provides [`TinyInstLauncher`] for spawning multiple fuzzing threads
-//! and [`SharedCorpusQueue`] for sharing corpus entries between threads.
+//! This module provides [`TinyInstLauncher`] for spawning multiple fuzzing threads.
+//!
+//! # Corpus Sharing
+//!
+//! For corpus sharing between processes, we recommend using file-based synchronization
+//! via [`OnDiskCorpus`](libafl::corpus::OnDiskCorpus) with periodic directory scanning.
+//!
+//! **Why not LLMP/TCP EventManager?**
+//! - TinyInst doesn't support fork(), which LLMP's restarting mechanism relies on
+//! - TinyInst's throughput is inherently low (~3 exec/sec for complex targets like ImageIO)
+//!   due to binary instrumentation overhead, making lock-free benefits negligible
+//! - File-based sharing is simple, reliable, and sufficient for TinyInst's use case
+//!
+//! See `fuzzers/binary_only/tinyinst_mac` for an example implementation with file-based
+//! corpus synchronization using [`OnDiskCorpus`](libafl::corpus::OnDiskCorpus).
 
-extern crate alloc;
-
-use alloc::sync::Arc;
 use core::time::Duration;
-use std::{
-    collections::VecDeque,
-    sync::Mutex,
-    thread::{self, JoinHandle},
-};
+use std::thread::{self, JoinHandle};
 
-use libafl::{Error, inputs::Input};
-
-/// Shared corpus queue for distributing testcases between fuzzing threads
-///
-/// Each thread can push new interesting testcases to the queue, and
-/// periodically pull testcases discovered by other threads.
-#[derive(Debug, Clone)]
-pub struct SharedCorpusQueue<I> {
-    queue: Arc<Mutex<VecDeque<I>>>,
-}
-
-impl<I> SharedCorpusQueue<I>
-where
-    I: Input,
-{
-    /// Create a new empty shared corpus queue
-    #[must_use]
-    pub fn new() -> Self {
-        Self {
-            queue: Arc::new(Mutex::new(VecDeque::new())),
-        }
-    }
-
-    /// Push a new testcase to the queue for other threads to discover
-    pub fn push(&self, input: I) {
-        if let Ok(mut queue) = self.queue.lock() {
-            queue.push_back(input);
-        }
-    }
-
-    /// Try to pop a testcase from the queue (non-blocking)
-    ///
-    /// Returns `None` if the queue is empty or lock fails
-    #[must_use]
-    pub fn pop(&self) -> Option<I> {
-        self.queue.lock().ok()?.pop_front()
-    }
-
-    /// Drain all testcases from the queue
-    ///
-    /// Returns a vector of all pending testcases
-    #[must_use]
-    pub fn drain(&self) -> Vec<I> {
-        if let Ok(mut queue) = self.queue.lock() {
-            queue.drain(..).collect()
-        } else {
-            Vec::new()
-        }
-    }
-
-    /// Get the current queue length
-    #[must_use]
-    pub fn len(&self) -> usize {
-        self.queue.lock().map(|q| q.len()).unwrap_or(0)
-    }
-
-    /// Check if the queue is empty
-    #[must_use]
-    pub fn is_empty(&self) -> bool {
-        self.len() == 0
-    }
-}
-
-impl<I> Default for SharedCorpusQueue<I>
-where
-    I: Input,
-{
-    fn default() -> Self {
-        Self::new()
-    }
-}
+use libafl::Error;
 
 /// Builder for [`TinyInstLauncher`]
 #[derive(Debug)]
@@ -152,26 +88,23 @@ impl<F> TinyInstLauncherBuilder<F> {
 /// Spawns multiple fuzzing threads, each running the provided client function
 /// with its thread ID. Each thread maintains its own independent fuzzer state.
 ///
-/// For sharing corpus entries between threads, use [`SharedCorpusQueue`]:
-/// each thread can push new testcases and pull testcases from other threads.
+/// For corpus sharing between threads/processes, use [`OnDiskCorpus`](libafl::corpus::OnDiskCorpus)
+/// pointing to a shared directory. Each process should periodically scan the directory
+/// for new entries added by other processes.
 ///
 /// # Example
 ///
 /// ```ignore
-/// use libafl_tinyinst::launcher::{TinyInstLauncher, SharedCorpusQueue};
-/// use libafl::inputs::BytesInput;
+/// use libafl_tinyinst::launcher::TinyInstLauncher;
 /// use std::time::Duration;
-///
-/// let shared_queue = SharedCorpusQueue::<BytesInput>::new();
 ///
 /// let launcher = TinyInstLauncher::builder()
 ///     .num_threads(4)
 ///     .launch_delay(Duration::from_millis(100))
 ///     .run_client(|thread_id| {
-///         let queue = shared_queue.clone();
-///         // In your fuzzer loop:
-///         // - When finding new testcase: queue.push(input)
-///         // - Periodically: for input in queue.drain() { add to corpus }
+///         // Initialize fuzzer with OnDiskCorpus pointing to shared directory
+///         // Run fuzzing loop
+///         // Periodically scan corpus directory for new entries from other threads
 ///         Ok(())
 ///     })
 ///     .build()?;
@@ -264,8 +197,10 @@ where
 
 #[cfg(test)]
 mod tests {
-    use alloc::sync::Arc;
-    use core::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
 
     use super::*;
 
